@@ -1,0 +1,197 @@
+name: Reusable Python CI
+
+# Reusable workflow: Python backend (pytest + ruff) with optional Postgres,
+# Redis, Alembic migrations and Next.js frontend build.
+#
+# Called from caller repos like:
+#
+#   jobs:
+#     ci:
+#       uses: akejonescode/shared-workflows/.github/workflows/ci-python.yml@main
+#       with:
+#         needs-postgres: true
+#         has-migrations: true
+#         has-frontend: true
+
+on:
+  workflow_call:
+    inputs:
+      python-version:
+        description: "Python version for the backend + lint jobs"
+        type: string
+        default: "3.12"
+      node-version:
+        description: "Node version for the frontend build job"
+        type: string
+        default: "20"
+      needs-postgres:
+        description: "Spin up a Postgres service container for the test job"
+        type: boolean
+        default: false
+      needs-redis:
+        description: "Spin up a Redis service container for the test job"
+        type: boolean
+        default: false
+      has-migrations:
+        description: "Run `poetry run alembic upgrade head` before tests"
+        type: boolean
+        default: false
+      test-command:
+        description: "Pytest (or other) command to run in the backend job"
+        type: string
+        default: "pytest tests/unit --tb=short -q"
+      ruff-paths:
+        description: "Paths passed to ruff check / ruff format"
+        type: string
+        default: "src tests"
+      has-frontend:
+        description: "Run a Next.js/npm build job"
+        type: boolean
+        default: false
+      frontend-dir:
+        description: "Directory of the frontend package (must contain package.json)"
+        type: string
+        default: "frontend"
+      frontend-public-api-url:
+        description: "Value baked into NEXT_PUBLIC_API_URL at build time"
+        type: string
+        default: "http://localhost:8000"
+
+jobs:
+  # ── Backend: pytest, optional services + migrations ──────────────────
+  backend:
+    name: Backend (Python ${{ inputs.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: ${{ inputs.needs-postgres && 'postgres:16-alpine' || '' }}
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+      redis:
+        image: ${{ inputs.needs-redis && 'redis:7-alpine' || '' }}
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Install Poetry
+        run: |
+          pipx install poetry
+          poetry --version
+
+      - name: Cache Poetry virtualenv
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pypoetry
+          key: poetry-${{ runner.os }}-${{ hashFiles('poetry.lock') }}
+          restore-keys: poetry-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: poetry install --no-interaction --no-root
+
+      - name: Apply Alembic migrations
+        if: ${{ inputs.has-migrations }}
+        run: poetry run alembic upgrade head
+        env:
+          DATABASE_URL: "postgresql+asyncpg://postgres:postgres@localhost:5432/test"
+          DATABASE_SYNC_URL: "postgresql://postgres:postgres@localhost:5432/test"
+
+      - name: Run tests
+        run: poetry run ${{ inputs.test-command }}
+        env:
+          # Keep tests offline by default: caller repos should mock externals.
+          # These are intentionally empty so anything that reads them errors
+          # obviously instead of hitting a real API.
+          AVANZA_USERNAME: ""
+          AVANZA_PASSWORD: ""
+          AVANZA_TOTP_SECRET: ""
+          AVANZA_ACCOUNT_ID: ""
+          TELEGRAM_BOT_TOKEN: ""
+          ANTHROPIC_API_KEY: ""
+          CREDENTIAL_ENCRYPTION_KEY: ""
+          DATABASE_URL: "postgresql+asyncpg://postgres:postgres@localhost:5432/test"
+          DATABASE_SYNC_URL: "postgresql://postgres:postgres@localhost:5432/test"
+          REDIS_URL: "redis://localhost:6379/0"
+
+  # ── Lint: ruff ───────────────────────────────────────────────────────
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Install Poetry
+        run: pipx install poetry
+
+      - name: Cache Poetry virtualenv
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pypoetry
+          key: poetry-${{ runner.os }}-${{ hashFiles('poetry.lock') }}
+          restore-keys: poetry-${{ runner.os }}-
+
+      - name: Install ruff only
+        run: poetry install --no-interaction --no-root --only dev
+
+      - name: ruff check
+        run: poetry run ruff check ${{ inputs.ruff-paths }}
+
+      - name: ruff format --check
+        run: poetry run ruff format --check ${{ inputs.ruff-paths }}
+
+  # ── Frontend: Next.js build (optional) ───────────────────────────────
+  frontend:
+    name: Frontend (Next.js)
+    if: ${{ inputs.has-frontend }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: ${{ inputs.frontend-dir }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: "npm"
+          cache-dependency-path: ${{ inputs.frontend-dir }}/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+        continue-on-error: true  # Style failures should not block dep bumps
+
+      - name: Build
+        run: npm run build
+        env:
+          NEXT_PUBLIC_API_URL: ${{ inputs.frontend-public-api-url }}

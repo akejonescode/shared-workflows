@@ -56,6 +56,10 @@ on:
         description: "Value baked into NEXT_PUBLIC_API_URL at build time"
         type: string
         default: "http://localhost:8000"
+      frontend-lint-strict:
+        description: "Fail the frontend job on lint errors (opt in once the repo lints clean)"
+        type: boolean
+        default: false
 
 jobs:
   # ── Backend: pytest, optional services + migrations ──────────────────
@@ -189,7 +193,8 @@ jobs:
 
       - name: Lint
         run: npm run lint
-        continue-on-error: true  # Style failures should not block dep bumps
+        # Non-strict repos: style failures should not block dep bumps
+        continue-on-error: ${{ !inputs.frontend-lint-strict }}
 
       - name: Build
         run: npm run build
